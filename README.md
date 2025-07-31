@@ -24,5 +24,5 @@ docker build -t $(whoami)/rknn-interactive . && docker run -it --rm $(whoami)/rk
 
 # Credits
 
-@c0zaut for the [ez-er-rkllm-toolkit](https://github.com/c0zaut/ez-er-rkllm-toolkit), which this pipeline is based on
-@happyme531 for the [Stable-Diffusion-1.5-LCM-ONNX-RKNN2](https://huggingface.co/happyme531/Stable-Diffusion-1.5-LCM-ONNX-RKNN2) repository, which the model conversion logic in the interactive pipeline script is based on
+* @c0zaut for the [ez-er-rkllm-toolkit](https://github.com/c0zaut/ez-er-rkllm-toolkit), which this pipeline is based on
+* @happyme531 for the [Stable-Diffusion-1.5-LCM-ONNX-RKNN2](https://huggingface.co/happyme531/Stable-Diffusion-1.5-LCM-ONNX-RKNN2) repository, which the model conversion logic in the interactive pipeline script is based on
