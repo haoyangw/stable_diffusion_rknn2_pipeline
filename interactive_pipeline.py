@@ -1,41 +1,35 @@
-from rkllm.api import RKLLM
+from rknn.api import RKNN
 from huggingface_hub import login, whoami, snapshot_download, auth_check, ModelCard, HfApi
 from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
 from pathlib import Path
+from typing import List
 import inquirer
 import shutil
 import os
 
-class RKLLMRemotePipeline:
-    def __init__(self, model_id="", lora_id="", platform="rk3588",
-                 qtype="w8a8", quantized_algorithm="normal", hybrid_rate="0.0", library_type="HF",
-                 optimization=1, max_context=""):
+"""
+Credits to:
+-@c0zaut for the ez-er-rkllm-toolkit interactive pipeline script, which this script is based on
+-@happyme531 for the convert-onnx-to-rknn.py script for converting Stable Diffusion ONNX model to
+  RKNN format, from which this script derives its model conversion logic
+"""
+
+class RKNNRemotePipeline:
+    def __init__(self, model_id: str = "", component_list: str = "", resolution_list: str = "",
+    		platform: str = "rk3588"):
         """
         Initialize primary values for pipeline class.
 
         :param model_id: HuggingFace repository ID for model (required)
-        :param lora_id: Same as model_id, but for LoRA (optional)
+        :param component_list: Comma-separated list of components to convert, e.g. 'text_encoder,unet,vae_decoder'
+        :param resolution_list: Comma-separated list of resolution(s) as pairs of (width, height)
+         for converted Stable Diffusion model(s)
         :param platform: CPU type of target platform. Must be rk3588 or rk3576
-        :param optimization: 1 means "optimize model" and 0 means "don't optimize" - may incrase performance,
-            at the expense of accuracy
-        :param qtype: either a string or list of quantization types
-        :param quantized_algorithm: Quantization accuracy optimization algorithm,
-            options are 'normal', 'grq' and 'gdq'. 'normal' supports all quantization types,
-            while 'grq' and 'gdq' only support 'w4a16' and grouped 'w4a16' quantization
-        :param hybrid_rate: block(group-wise quantization) ratio, whose value is between 
-            0 and 1, 0 indicating the disable of mixed quantization
-        :param max_context: Maximum context length for converted model, up to 16,384 and
-            must be divisible by 32
         """
-        self.model_id = model_id
-        self.lora_id = lora_id
-        self.platform = platform
-        self.qtype = qtype
-        self.quantized_algorithm = quantized_algorithm
-        self.hybrid_rate = hybrid_rate
-        self.library_type = library_type
-        self.optimization = optimization
-        self.max_context = max_context
+        self.model_id: str = model_id
+        self.component_list: str = component_list
+        self.resolution_list: str = resolution_list
+        self.platform: str = platform
 
     @staticmethod
     def mkpath(path):
@@ -58,81 +52,142 @@ class RKLLMRemotePipeline:
     def cleanup_models(path=Path("./models")):
         print(f"Cleaning up model directory...")
         shutil.rmtree(path)
+    
+    # Based on parse_resolution_list() from
+    #  https://huggingface.co/happyme531/Stable-Diffusion-1.5-LCM-ONNX-RKNN2/blob/main/convert-onnx-to-rknn.py
+    @staticmethod
+    def parse_resolution_list(resolutions: str) -> List[List[int]]:
+        resolution_pairs = resolutions.split(',')
+        parsed_resolutions = []
+        for pair in resolution_pairs:
+            width, height = map(int, pair.split('x'))
+            parsed_resolutions.append([width, height])
+        return parsed_resolutions
 
     def user_inputs(self):
         '''
-        Obtain necessary inputs for model generation
-        This remote pipeline downloads the selected model and LoRA (if one is selected.)
-        It then iterates through and exports a model for each quantization type.
+        Obtain necessary inputs for model conversion
+        This remote pipeline downloads the selected model
+        It then iterates through and exports a model for each output resolution.
         '''
         self.inputs = [
             inquirer.Text("model_id", 
-                          message="HuggingFace Repo ID for Model in user/repo format (default is Qwen/Qwen2.5-7B-Instruct)", 
-                          default="Qwen/Qwen2.5-7B-Instruct"),
-            inquirer.Text("lora_id", 
-                          message="HuggingFace LoRA ID for Model in user/repo format",
-                          default=None),
-            inquirer.List("library", 
-                          message="HuggingFace or GGUF Format?", 
-                          choices=["HF","GGUF"], 
-                          default="HF"),
+                          message="HuggingFace Repo ID for Stable Diffusion Model in user/repo format (default is TheyCallMeHex/LCM-Dreamshaper-V7-ONNX)", 
+                          default="TheyCallMeHex/LCM-Dreamshaper-V7-ONNX"),
+            inquirer.Text("component_list",
+                          message="Comma-separated list of the components to convert, e.g. 'text_encoder,unet,vae_decoder'",
+                          default="text_encoder, unet, vae_decoder"),
+            inquirer.Text("resolution_list",
+                          message="Comma-separated list of resolution(s) for the converted model(s), e.g. '256x256,512x512'",
+                          default="256x256"),
             inquirer.List("platform", 
                           message="Which platform would you like to build for?", 
-                          choices=["rk3588", "rk3576"], 
-                          default="rk3588"),
-            inquirer.List("optimization",
-                          message="Optimize model?\nBetter performance, longer conversion\n0=None\n1=Yes",
-                          choices=[0, 1]),
-            inquirer.List("qtype", 
-                              message="Quantization type?", 
-                              choices=["w8a8", "w8a8_g128", "w8a8_g256", "w8a8_g512"], 
-                              ignore=lambda x: not x["platform"] == "rk3588"),
-            inquirer.List("qtype", 
-                              message="Quantization type?", 
-                              choices=["w8a8", "w4a16", "w4a16_g32", "w4a16_g64", "w4a16_g128"], 
-                              ignore=lambda x: not x["platform"] == "rk3576"),
-            inquirer.Text("hybrid_rate",
-                          message="Block (group-wise quantization) ratio, whose value is between 0 and 1, 0 indicating none",
-                          default="0.0"),
-            inquirer.Text("max_context",
-                          message="Maximum context length for converted model, up to 16,384 and must be divisible by 32",
-                          default="")
+                          choices=["rk3562", "rk3566", "rk3568", "rk3576", "rk3588"], 
+                          default="rk3588")
         ]
         
         self.config = inquirer.prompt(self.inputs)
         
         self.model_id = self.config["model_id"]
-        self.lora_id = self.config["lora_id"]
+        self.component_list = self.config["component_list"]
+        self.resolution_list = self.config["resolution_list"]
         self.platform = self.config["platform"]
-        self.optimization = int(self.config["optimization"])
-        self.qtype = self.config["qtype"]
-        self.hybrid_rate = float(self.config["hybrid_rate"])
-        self.library_type = self.config["library"]
-        self.max_context = self.config["max_context"]
         
     def build_vars(self):
-        if self.platform == "rk3588":
-            self.npu_cores = 3
-        elif self.platform == "rk3576":
-            self.npu_cores = 2
-        self.dataset = None
-        self.qparams = None
-        self.device = "cpu"
-        self.model_name = self.model_id.split("/", 1)[1]
-        self.model_dir = f"./models/{self.model_name}/"
-        self.name_suffix = f"{self.platform}-{self.qtype}-opt-{self.optimization}-hybrid-ratio-{self.hybrid_rate}"
-        if self.lora_id == "":
-            self.lora_name = None
-            self.lora_dir = None
-            self.lorapath = None
-            self.export_name = f"{self.model_name}-{self.name_suffix}"
-            self.export_path = f"./models/{self.model_name}-{self.platform}/"
+        # Parse comma-seperated string of resolutions into list of pairs (width, height)
+        self.resolutions: List[List[int]] = self.parse_resolution_list(self.resolution_list)
+        # Split comma-seperated string of components into list of component names
+        self.components: List[str] = self.component_list.split(',')
+        self.model_name: str = self.model_id.split("/", 1)[1]
+        self.model_dir: str = f"./models/{self.model_name}/"
+        self.name_suffix: str = f"{self.platform}"
+        self.export_name: str = f"{self.model_name}-{self.name_suffix}"
+        self.export_path: str = f"./models/{self.model_name}-{self.platform}/"
+        self.rknn_version: str = "2.3.0"
+
+    # Based on convert_pipeline_component() function from
+    #  https://huggingface.co/happyme531/Stable-Diffusion-1.5-LCM-ONNX-RKNN2/blob/main/convert-onnx-to-rknn.py
+    def convert_local_model(self, model_path: str, export_path: str, 
+            resolution_list: List[List[int]], target_platform: str = "rk3588",
+            optimization_level: int = 3, do_quantization: bool = False):
+        print(f'Converting {model_path} to RKNN model')
+        print(f'    with target platform {target_platform}')
+        print(f'    with resolutions:')
+        for res in resolution_list:
+            print(f'    - {res[0]}x{res[1]}')
+        use_dynamic_shape: bool = False
+        if(len(resolution_list) > 1):
+            print("Warning: RKNN dynamic shape support is probably broken, may throw errors")
+            use_dynamic_shape = True
+
+        batch_size: int = 1
+        LATENT_RESIZE_FACTOR: int = 8
+        # build shape list
+        if "text_encoder" in model_path:
+            input_size_list = [[[1,77]]]
+            inputs=['input_ids']
+            use_dynamic_shape = False
+        elif "unet" in model_path:
+            # batch_size = 2  # for classifier free guidance # broken for rknn python api
+
+            input_size_list = []
+            for res in resolution_list:
+                input_size_list.append(
+                    [[1,4, res[0]//LATENT_RESIZE_FACTOR, res[1]//LATENT_RESIZE_FACTOR],
+                     [1],
+                     [1, 77, 768],
+                     [1, 256]]
+                )
+            inputs=['sample','timestep','encoder_hidden_states','timestep_cond']
+        elif "vae_decoder" in model_path:
+            input_size_list = []
+            for res in resolution_list:
+                input_size_list.append(
+                    [[1,4, res[0]//LATENT_RESIZE_FACTOR, res[1]//LATENT_RESIZE_FACTOR]]
+                )
+            inputs=['latent_sample']
         else:
-            self.lora_name = self.lora_id.split("/", 1)[1]
-            self.lora_dir = f"./models/{self.lora_name}/"
-            self.export_name = f"{self.model_name}-{self.lora_name}-{self.name_suffix}"
-            self.export_path = f"./models/{self.model_name}-{self.lora_name}-{self.platform}/"
-        self.rkllm_version = "1.2.1"
+            print("Unknown component: ", model_path)
+            return ret
+
+        # Instantiate RKNN class
+        self.rknn = RKNN(verbose=True)
+
+        # pre-process config
+        print('--> Config model')
+        self.rknn.config(target_platform=target_platform, optimization_level=optimization_level,
+                    single_core_mode=True,
+                    dynamic_input= input_size_list if use_dynamic_shape else None)
+        print('done')
+
+        # Load ONNX model
+        print('--> Loading model')
+        ret: int = self.rknn.load_onnx(model=model_path,
+                             inputs=None if use_dynamic_shape else inputs,
+                             input_size_list= None if use_dynamic_shape else input_size_list[0])   
+        if ret != 0:
+            print('Load model failed!')
+            return ret
+        print('done')
+
+        # Build model
+        print('--> Building model')
+        ret = self.rknn.build(do_quantization=do_quantization, rknn_batch_size=batch_size)
+        if ret != 0:
+            print('Build model failed!')
+            return ret
+        print('done')
+
+        # Export converted model
+        print('--> Export RKNN model')
+        ret = self.rknn.export_rknn(export_path)
+        if ret != 0:
+            print('Export RKNN model failed!')
+            return ret
+        print('done')
+
+        self.rknn.release()
+        print('RKNN model is converted successfully!')
 
     def remote_pipeline_to_local(self):
         '''
@@ -143,87 +198,42 @@ class RKLLMRemotePipeline:
         print(f"Checking if {self.model_dir} and {self.export_path} exist...")
         self.mkpath(self.model_dir)
         self.mkpath(self.export_path)
-
-        print(f"Loading base model {self.model_id} from HuggingFace and downloading to {self.model_dir}")
-        self.modelpath = snapshot_download(repo_id=self.model_id, local_dir=self.model_dir)
-
-        if self.lora_id == None:
-            print(f"LoRA is {self.lora_id} - skipping download")
-        else:
-            print (f"Downloading LoRA: {self.lora_id} from HuggingFace to {self.lora_dir}")
-            try:
-                self.lorapath = snapshot_download(repo_id=self.lora_id, local_dir=self.lora_dir)
-            except:
-                print(f"Downloading LoRA failed. Omitting from export.")
-                self.lorapath == None
-
-        print("Initializing RKLLM class...")
-        self.rkllm = RKLLM()
+        for component in self.components:
+            self.mkpath(f'{self.export_path}/{component.strip()}')
         
-        if self.library_type == "HF":
-            print(f"Have to load model for each config")
-            status = self.rkllm.load_huggingface(model=self.modelpath, model_lora=self.lorapath, 
-                                                device=self.device)
-            if status != 0:
-                raise RuntimeError(f"Failed to load model: {status}")
-            else:
-                print(f"{self.model_name} loaded successfully!")    
-        elif self.library_type == "GGUF":
-            print(f"Have to load model for each config")
-            status = self.rkllm.load_gguf(model=self.modelpath)
-            if status != 0:
-                raise RuntimeError(f"Failed to load model: {status}")
-            else:
-                print(f"{self.model_name} loaded successfully!")
-        else:
-            print("Model must be of type HF (HuggingFace) or GGUF.")
-            raise RuntimeError("Must be something wrong with the selector! Try again!")
+        if(len(self.resolutions) == 0):
+            print("Error: No resolution(s) specified for converted model(s)")
+            # Return non-zero code(1) to indicate that an error occurred to caller
+            return 1
 
-        print(f"Building {self.model_name} with {self.qtype} quantization and optmization level {self.optimization}")
-        if self.max_context:
-        	self.max_context = int(self.max_context)
-        	status = self.rkllm.build(do_quantization=True, optimization_level=self.optimization,
-        							quantized_dtype=self.qtype, quantized_algorithm=self.quantized_algorithm,
-        							hybrid_rate=self.hybrid_rate, target_platform=self.platform,
-        							num_npu_core=self.npu_cores, extra_qparams=self.qparams,
-        							dataset=self.dataset, max_context=self.max_context)
-        else:
-        	status = self.rkllm.build(do_quantization=True, optimization_level=self.optimization,
-        							quantized_dtype=self.qtype, quantized_algorithm=self.quantized_algorithm,
-        							hybrid_rate=self.hybrid_rate, target_platform=self.platform,
-        							num_npu_core=self.npu_cores, extra_qparams=self.qparams,
-        							dataset=self.dataset)
-        if status != 0:
-            raise RuntimeError(f"Failed to build model: {status}")
-        else:
-            print(f"{self.model_name} built successfully!")
-    
-        status = self.rkllm.export_rkllm(f"{self.export_path}{self.export_name}.rkllm")
-        if status != 0:
-            raise RuntimeError(f"Failed to export model: {status}")
-        else:
-            print(f"{self.model_name} exported successfully to {self.export_path}!")
+        print(f"Loading source model {self.model_id} from HuggingFace and downloading to {self.model_dir}")
+        self.models_path: str = snapshot_download(repo_id=self.model_id, local_dir=self.model_dir)
+        
+        for component in self.components:
+            onnx_path: str = f'{self.models_path}/{component.strip()}/model.onnx'
+            output_model_path: str = f'{self.export_path}/{component.strip()}/model.rknn'
+            self.convert_local_model(model_path=onnx_path, export_path=output_model_path,
+                                 resolution_list=self.resolutions, target_platform=self.platform)
 
 
 # Don't trust super().__init__ here    
 class HubHelpers:
-    def __init__(self, platform, model_id, lora_id, qtype, rkllm_version):
+    def __init__(self, platform, model_id, resolutions, rknn_version):
         """
         Collection of helpers for interacting with HuggingFace.
         Due to some weird memory leak-y behaviors observed, would rather pass down
         parameters from the pipeline class then try to do something with super().__init__
 
         :param platform: CPU type of target platform. Must be rk3588 or rk3576
-        :param model_id: HuggingFace repository ID for model (required)
-        :param lora_id: Same as model_id, but for LoRA (optional)
-        :param rkllm_version: version of RKLLM used for conversion.
+        :param model_id: HuggingFace repository ID for source model (required)
+        :param resolutions: Comma-seperated list of resolution(s) as pairs of (width, height)
+         for converted Stable Diffusion model(s)
+        :param rknn_version: Version of RKNN used for conversion.
         """
         self.model_id = model_id
-        self.lora_id = lora_id
+        self.resolutions = resolutions
         self.platform = platform
-        self.qtype = qtype
-        self.models = {"base": model_id, "lora": lora_id}
-        self.rkllm_version = rkllm_version
+        self.rknn_version = rknn_version
         self.home_dir = os.environ['HOME']
         # Use Rust implementation of transfer for moar speed
         os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
@@ -280,17 +290,14 @@ class HubHelpers:
         self.template = f'---\n' + \
             f'{self.card_in.data.to_yaml()}\n' + \
             f'---\n' + \
-            f'# {self.model_name}-{self.platform.upper()}-{self.rkllm_version}\n\n' + \
-            f'This version of {self.model_name} has been converted to run on the {self.platform.upper()} NPU using {self.qtype} quantization.\n\n' + \
-            f'This model has been optimized with the following LoRA: {self.lora_id}\n\n' + \
-            f'Compatible with RKLLM version: {self.rkllm_version}\n\n' + \
+            f'# {self.model_name}-{self.platform.upper()}-{self.rknn_version}\n\n' + \
+            f'This version of {self.model_name} has been converted to run on the {self.platform.upper()} NPU and generate images of resolution(s) {self.resolutions}.\n\n' + \
+            f'Compatible with RKNN version: {self.rknn_version}\n\n' + \
             f'## Useful links:\n' + \
-            f'[Official RKLLM GitHub](https://github.com/airockchip/rknn-llm) \n\n' + \
+            f'[Official RKNN GitHub](https://github.com/airockchip/rknn-toolkit2) \n\n' + \
             f'[RockhipNPU Reddit](https://reddit.com/r/RockchipNPU) \n\n' + \
-            f'[EZRKNN-LLM](https://github.com/Pelochus/ezrknn-llm/) \n\n' + \
             f'Pretty much anything by these folks: [marty1885](https://github.com/marty1885) and [happyme531](https://huggingface.co/happyme531) \n\n' + \
-            f'Converted using https://github.com/c0zaut/ez-er-rkllm-toolkit \n\n' + \
-            f'# Original Model Card for base model, {self.model_name}, below:\n\n' + \
+            f'# Original Model Card for source model, {self.model_name}, below:\n\n' + \
             f'{self.card_in.text}'
         try:
             ModelCard.save(self.template, self.card_out)
@@ -306,7 +313,7 @@ class HubHelpers:
 
     def upload_to_repo(self, model, import_path, export_path):
         self.hf_api = HfApi(token=self.hf_token)
-        self.repo_id = f"{self.hf_username}/{model}-{self.platform}-{self.rkllm_version}"
+        self.repo_id = f"{self.hf_username}/{model}-{self.platform}-{self.rknn_version}"
         
         print(f"Creating repo if it does not already exist")
         try:
@@ -321,18 +328,19 @@ class HubHelpers:
         self.import_path = Path(import_path)
         self.export_path = Path(export_path)
         print(f"Uploading files to repo")
-        shutil.copytree(self.import_path, self.export_path, ignore=shutil.ignore_patterns('*.safetensors', '*.pt*', '*.bin', '*.gguf', 'README*'), 
+        shutil.copytree(self.import_path, self.export_path,
+                        ignore=shutil.ignore_patterns('*.onnx*', '*.txt', 'README*'), 
                         copy_function=shutil.copy2, dirs_exist_ok=True)
         self.commit_info = self.hf_api.upload_folder(repo_id=self.repo_id, folder_path=self.export_path)
         print(self.commit_info)
 
 if __name__ == "__main__":
 
-    rk = RKLLMRemotePipeline()
+    rk = RKNNRemotePipeline()
     rk.user_inputs()
     rk.build_vars()
-    hf = HubHelpers(platform=rk.platform, model_id=rk.model_id, lora_id=rk.lora_id, 
-                    qtype=rk.qtype, rkllm_version=rk.rkllm_version)
+    hf = HubHelpers(platform=rk.platform, model_id=rk.model_id, resolutions=rk.resolution_list,
+                    rknn_version=rk.rknn_version)
     hf.login_to_hf()
     hf.repo_check(rk.model_id)
 
